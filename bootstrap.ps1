@@ -1,0 +1,181 @@
+# bootstrap.ps1 — Setup do framework metacognitivo em PC novo (Windows)
+#
+# Idempotente: rodar 2x não destrói nada. Faz git config (com confirmação se
+# já existe), garante gh CLI autenticado, clona o repo principal e
+# opcionalmente o repo privado de memória.
+#
+# USO:
+#   pwsh ./bootstrap.ps1 [-MemoryRepo "<owner/repo>"] [-ProjectDir "<path>"]
+#
+# Exemplos:
+#   # Setup só do framework (sem memória própria):
+#   pwsh ./bootstrap.ps1
+#
+#   # Setup completo (mantenedor, com seu repo de memória privado):
+#   pwsh ./bootstrap.ps1 -MemoryRepo "fabriciopsouza/claude-memory-metacognition-framework"
+#
+#   # Custom path (default = ~/dev/metacognition-framework):
+#   pwsh ./bootstrap.ps1 -ProjectDir "D:\code\metacognition-framework"
+#
+# Equivalente macOS/Linux: bootstrap.sh (mesma raiz).
+
+param(
+    [string]$MemoryRepo = "",
+    [string]$ProjectDir = "$env:USERPROFILE\dev\metacognition-framework",
+    [string]$GitEmail = "",
+    [string]$GitName = ""
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
+function Write-Ok($msg)   { Write-Host "    OK  $msg" -ForegroundColor Green }
+function Write-Warn($msg) { Write-Host "    !!  $msg" -ForegroundColor Yellow }
+
+# 1. Pre-checks: git e gh instalados
+Write-Step "Verificando pre-requisitos (git, gh)"
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    throw "git nao encontrado. Instalar: https://git-scm.com/download/win"
+}
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    throw "gh CLI nao encontrado. Instalar: https://cli.github.com/"
+}
+Write-Ok "git e gh instalados"
+
+# 2. Git config global (so seta se nao existir; nao sobrescreve)
+Write-Step "Verificando git config global"
+$currentEmail = git config --global user.email 2>$null
+$currentName  = git config --global user.name 2>$null
+
+if (-not $currentEmail) {
+    if (-not $GitEmail) {
+        $GitEmail = Read-Host "user.email nao configurado. Informar"
+    }
+    git config --global user.email $GitEmail
+    Write-Ok "user.email setado para: $GitEmail"
+} else {
+    Write-Ok "user.email ja configurado: $currentEmail"
+}
+
+if (-not $currentName) {
+    if (-not $GitName) {
+        $GitName = Read-Host "user.name nao configurado. Informar"
+    }
+    git config --global user.name $GitName
+    Write-Ok "user.name setado para: $GitName"
+} else {
+    Write-Ok "user.name ja configurado: $currentName"
+}
+
+# 3. gh CLI autenticado
+Write-Step "Verificando autenticacao gh CLI"
+$ghStatus = gh auth status 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn "gh CLI nao autenticado. Abrindo fluxo interativo..."
+    gh auth login
+    if ($LASTEXITCODE -ne 0) { throw "gh auth login falhou" }
+}
+Write-Ok "gh CLI autenticado"
+
+# 4. Clone do repo principal (skip se ja existir)
+Write-Step "Clonando metacognition-framework em $ProjectDir"
+if (Test-Path $ProjectDir) {
+    Write-Warn "Diretorio ja existe; pulando clone (use 'git pull' la dentro se quiser atualizar)"
+} else {
+    New-Item -ItemType Directory -Path (Split-Path $ProjectDir) -Force | Out-Null
+    gh repo clone fabriciopsouza/metacognition-framework-public-nonadmin $ProjectDir
+    if ($LASTEXITCODE -ne 0) { throw "Clone falhou" }
+    Write-Ok "Repo principal clonado"
+}
+
+# 5. Clone do repo de memoria (opcional, so se -MemoryRepo passado)
+if ($MemoryRepo) {
+    Write-Step "Configurando memoria do Claude Code a partir de $MemoryRepo"
+    $memoryPath = "$env:USERPROFILE\.claude\projects\f--metacognition-framework\memory"
+
+    if (Test-Path $memoryPath) {
+        # Backup nao-destrutivo
+        $backupPath = "$memoryPath.backup.$(Get-Date -Format yyyyMMdd-HHmmss)"
+        Move-Item -Path $memoryPath -Destination $backupPath
+        Write-Warn "Memoria existente movida para: $backupPath"
+    }
+
+    New-Item -ItemType Directory -Path (Split-Path $memoryPath) -Force | Out-Null
+    gh repo clone $MemoryRepo $memoryPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Clone do repo de memoria falhou. Repo existe e voce tem acesso? URL informada: $MemoryRepo"
+    } else {
+        Write-Ok "Memoria do Claude Code sincronizada"
+    }
+} else {
+    Write-Ok "Sem -MemoryRepo informado; pulando setup de memoria (terceiros que clonam o framework usam memoria propria)"
+}
+
+# 6. Configurar auto-boot global (ADR-006 v1.8.0)
+Write-Step "Configurando auto-boot global (ADR-006)"
+$globalDir      = Join-Path $env:USERPROFILE '.claude'
+$ownersFile     = Join-Path $globalDir 'squad-owners.txt'
+if (-not (Test-Path $globalDir)) { New-Item -ItemType Directory -Path $globalDir -Force | Out-Null }
+
+# squad-owners.txt: nao sobrescrever se ja existe (respeita customizacao do usuario)
+if (-not (Test-Path $ownersFile)) {
+    $defaultOwners = @(
+        '# squad-owners.txt - allowlist de owners para auto-boot global (ADR-006).'
+        '# Uma linha por token; substring match case-insensitive contra owner do remote origin.'
+        '# Use # para comentar; linhas vazias ignoradas.'
+        'fpsouza'
+        'fpsouz'
+        'fsouza'
+        'fabriciosouza'
+        'fabriciopsouza'
+        'SEU-USUARIO'
+        'SUA-ORG'
+    )
+    Set-Content -Path $ownersFile -Value $defaultOwners -Encoding UTF8
+    Write-Ok "squad-owners.txt criado com 7 tokens default"
+} else {
+    Write-Ok "squad-owners.txt ja existe; preservando customizacao"
+}
+
+# Wiring de hooks globais via ensure-global-wiring (ADR-027). Garante:
+#   hooks.SessionStart     -> inject-start-session-global (auto-boot, ADR-006)
+#   hooks.UserPromptSubmit -> route-gate                  (roteamento determinístico)
+# Hook-preserving, idempotente, com backup/validação. MESMA rotina que o sync-global
+# invoca a cada abertura do repo (self-heal) — derrota o clobber do mode-apply
+# (execution-modes §5 manda "preservar hooks", mas isso é prosa; aqui vira mecanismo).
+$ensureWiring = Join-Path $ProjectDir 'tools\hooks\ensure-global-wiring.ps1'
+if (Test-Path $ensureWiring) {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ensureWiring -RepoDir $ProjectDir 2>$null
+    switch ($LASTEXITCODE) {
+        10      { Write-Ok "hooks globais wirados: SessionStart inject-global + UserPromptSubmit route-gate (ADR-027)" }
+        0       { Write-Ok "hooks globais ja wirados; preservando" }
+        default { Write-Warn "ensure-global-wiring codigo $LASTEXITCODE; ver ~/.claude/settings.json.heal.bak" }
+    }
+} else {
+    Write-Warn "tools/hooks/ensure-global-wiring.ps1 ausente; wiring global pulado (abra o repo-framework p/ sync)"
+}
+
+# Rodada inicial do sync-global para popular ~/.claude/hooks/ + workflows/
+$syncScript = Join-Path $ProjectDir '.claude\hooks\sync-global.ps1'
+if (Test-Path $syncScript) {
+    Write-Step "Rodada inicial do sync-global"
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $syncScript | Out-Null
+    Write-Ok "Sync inicial executado"
+}
+
+# 7. Resumo final
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host " Setup concluido. Proximos passos:" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host " 1. cd `"$ProjectDir`""
+Write-Host " 2. Abrir Claude Code (em qualquer projeto seu)."
+Write-Host "    -> SessionStart hook global ativa PMO automaticamente"
+Write-Host "       se o owner do remote bate com ~/.claude/squad-owners.txt"
+Write-Host "       ou se o projeto tem AGENTS.md / .agent/"
+Write-Host " 3. Para pular auto-boot:"
+Write-Host "       New-Item .claude/session.lock -ItemType File -Force   (este projeto)"
+Write-Host "       New-Item ~/.claude/session.lock -ItemType File -Force (todos)"
+Write-Host " 4. Para adicionar owner: editar ~/.claude/squad-owners.txt"
+Write-Host ""
+Write-Host " Pronto." -ForegroundColor Green
