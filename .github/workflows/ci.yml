@@ -1,0 +1,85 @@
+# CI cross-platform dos canários do framework (ADR-040 — item 8 do plano de remediação v2).
+#
+# GAP que fecha: toda a cadeia de hooks nasceu PowerShell-first; os `.sh` eram paridade
+# DECLARADA não-validada (`[DESCONHECIDO]`). Esta matriz roda TODOS os canários nos 3 SOs
+# com pwsh+bash+jq pré-instalados, e o `test_parity.py` exige veredito idêntico .ps1↔.sh.
+# Só com 3 SOs verdes + paridade 100% é honesto remover o `[DESCONHECIDO]` dos headers.
+#
+# Entrypoint = `tools/run_canaries.py` (NÃO `pytest tools/`): os canários são scripts
+# standalone (exit 0/!=0), não casos pytest-collectáveis. Canários que dependem de um shell
+# ausente auto-marcam SKIP — ambiente nunca reprova; só canário que efetivamente falhou.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canaries:
+    name: canários (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      # stdout UTF-8 em todos os runners: o Windows usa cp1252 e quebra em chars como ✅/→/×
+      # presentes nas mensagens dos canários. Alinha o runner à convenção do repo (reconfigure utf-8).
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências de dev (parsers opcionais)
+        run: python -m pip install --upgrade pip && pip install -r tools/requirements-dev.txt
+
+      - name: Verificar shells disponíveis (pwsh/bash/jq pré-instalados nos runners)
+        shell: bash
+        run: |
+          echo "pwsh:  $(command -v pwsh || echo ausente)"
+          echo "bash:  $(command -v bash || echo ausente)"
+          echo "jq:    $(command -v jq   || echo ausente)"
+
+      - name: Rodar todos os canários
+        run: python tools/run_canaries.py -v
+
+      - name: LIMITS.md em sync com os canários (ADR-044 — o doc não pode mentir)
+        run: python tools/build_limits.py --check
+
+      - name: Gate de agnosticismo do núcleo (ADR-020, tier norma)
+        # Só o tier NORMA roda aqui: a FONTE PRIVADA carrega nomes do incidente de campo por
+        # design (cofre do dono). O tier --sensitive é o gate de EXPORT (publish-clean.yml),
+        # roda contra a árvore LIMPA, não contra o source privado — senão falso-positivo.
+        run: python tools/check_core_agnostic.py
+
+      - name: Equivalência cross-IA + autenticidade HITL (ADR-071 — condicional ao hub)
+        # Move equivalence-gate de "ci-ready" p/ "ci-wired": SE o manifest do hub estiver presente
+        # (var HUB_MANIFEST apontando p/ um manifest checkado no runner, ex. hub como submodulo ou
+        # baixado via deploy key), roda o equivalence_gate E verifica a assinatura de cada hitl_proof
+        # via git verify-commit. SEM o hub (estado atual: hub e repo privado separado, nao no runner)
+        # o passo declara a dependencia honestamente — NAO finge enforcement. Acao do dono: prover o
+        # hub ao runner (submodulo/deploy key) p/ tornar a verificacao plena.
+        shell: bash
+        run: |
+          if [ -n "${HUB_MANIFEST:-}" ] && [ -f "${HUB_MANIFEST}" ]; then
+            echo "Hub manifest presente: ${HUB_MANIFEST}"
+            python tools/equivalence_gate.py "${HUB_MANIFEST}" --ais claude,gemini
+            # SEM --require-all: pr:/approved-pr: sao formatos VALIDOS (ADR-071 PROOF_RE), verificados
+            # pela API do forge, NAO pelo git -> passam como declarados. So commit:/tag: nao-assinados
+            # derrubam (fail-closed na assinatura, nao na categoria).
+            python tools/verify_hitl_proofs.py "${HUB_MANIFEST}" --repo "${HUB_REPO:-.}"
+          else
+            echo "[equivalence/HITL] HUB_MANIFEST ausente — verificacao plena requer o hub provisionado"
+            echo "no runner (submodulo ou deploy key). Logica validada pelos canarios"
+            echo "test_equivalence_gate.py + test_verify_hitl_proofs.py. Dependencia declarada (ADR-071)."
+          fi

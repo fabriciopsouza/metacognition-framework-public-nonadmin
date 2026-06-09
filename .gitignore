@@ -1,0 +1,33 @@
+# Framework — não versionar
+.agent/brain/
+.env
+.env.*
+*.key
+*.pem
+**/credentials*.json
+outputs/
+output/
+
+# v1.6.1 — flag de escape do auto-start-session (pessoal por cópia de trabalho)
+.claude/session.lock
+/WORKING-CONTEXT.md
+
+# Claude Code scheduler internal
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+
+# ADR-060/061: markers de liveness dos hooks (por sessao/maquina — nunca versionar)
+.claude/.hooklive/
+.claude/.repo-sync-marker
+
+# ADR-064: staging local de relatorios anonimizados (gerado, nao versionar no repo-fonte)
+telemetry/learnings-public/
+
+# ADR-065: estado da oferta de relatorio por solucao (por maquina; nao versionar)
+.claude/.report-offers/
+
+# ADR-068: catalogo de insights gerado offline (owner-only; nao distribuir)
+docs/_private/_catalog/
+
+# Permissoes pessoais (nao distribuir) — ADR-005/047
+.claude/settings.local.json
